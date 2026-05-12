@@ -24,7 +24,8 @@ Ts     = 0.01
 N      = 500           # total steps (5 s)
 CA_END = 100           # last CA step  (1 s)
 CV_END = 200           # last CV step  (2 s), CT begins after
-OMEGA  = np.deg2rad(45.0)   # turn rate [rad/s]
+OMEGA_TRUE  = np.deg2rad(30.0)   # ground-truth turn rate [rad/s]
+OMEGA_MODEL = np.deg2rad(20.0)   # CT model's assumed turn rate [rad/s] — set differently to test mismatch
 
 SIGMA_OBS_POS = 0.1    # position measurement noise [m]
 SIGMA_OBS_VEL = 0.5    # velocity measurement noise [m/s]
@@ -61,7 +62,7 @@ def ground_truth() -> tuple:
             x[k]  = x[k-1] + Ts * vx[k-1]
             y[k]  = y[k-1]  + Ts * vy[k-1]
         else:                                       # --- CT with turn-rate jitter ---
-            omega_k  = OMEGA + np.random.randn() * sigma_omega
+            omega_k  = OMEGA_TRUE + np.random.randn() * sigma_omega
             theta_k  = omega_k * Ts
             sk, ck   = np.sin(theta_k), np.cos(theta_k)
             x[k]  = x[k-1] + sk/omega_k * vx[k-1] - (1 - ck)/omega_k * vy[k-1]
@@ -77,7 +78,7 @@ def ground_truth() -> tuple:
 # ---------------------------------------------------------------------------
 
 def build_imm() -> IMMKF:
-    turn_deg = np.rad2deg(OMEGA)
+    turn_deg = np.rad2deg(OMEGA_MODEL)
     ca_model = make_2d_ca_model(Ts, sigma_j=3.0,  sigma_obs_pos=SIGMA_OBS_POS, sigma_obs_vel=SIGMA_OBS_VEL)
     cv_model = make_2d_cv_model(Ts, sigma_cv=0.5, sigma_obs_pos=SIGMA_OBS_POS, sigma_obs_vel=SIGMA_OBS_VEL)
     ct_model = make_2d_ct_model(Ts, turn_rate_deg=turn_deg, sigma_obs_pos=SIGMA_OBS_POS, sigma_obs_vel=SIGMA_OBS_VEL)
@@ -142,8 +143,10 @@ def run_demo():
     t_cv = CV_END * Ts
 
     fig, axes = plt.subplots(4, 1, figsize=(11, 15))
+    mismatch = "" if np.isclose(OMEGA_TRUE, OMEGA_MODEL) else \
+        f"  [MISMATCH: true={np.rad2deg(OMEGA_TRUE):.1f}°/s, model={np.rad2deg(OMEGA_MODEL):.1f}°/s]"
     fig.suptitle(
-        "IMM-KF: CA → CV → CT Mode-Switching Tracking\n"
+        f"IMM-KF: CA → CV → CT Mode-Switching Tracking{mismatch}\n"
         "State: [x, vx, ax, y, vy, ω]  |  Models: distinct F per mode  |  Obs: [x, vx, y, vy]",
         fontsize=11, fontweight='bold',
     )
