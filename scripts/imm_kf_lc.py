@@ -259,7 +259,7 @@ def run_demo():
     # -----------------------------------------------------------------------
     t_maneuver = MANEUVER_STEP * Ts
 
-    fig, axes = plt.subplots(6, 1, figsize=(11, 18))
+    fig, axes = plt.subplots(5, 1, figsize=(11, 15))
     fig.suptitle(
         "IMM-KF: Joint Longitudinal + Lateral Estimation\n"
         "Vehicle accelerates AND changes lane left at t = 3 s",
@@ -343,30 +343,7 @@ def run_demo():
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # -- (5) Bird's-eye view trajectory --
-    ax = axes[5]
-    # Lane fill
-    ax.axhspan(-LANE_WIDTH/2,   LANE_WIDTH/2,   color='lightgray', alpha=0.4,
-               label='Original lane')
-    ax.axhspan( LANE_WIDTH/2, 3*LANE_WIDTH/2,   color='lightblue', alpha=0.4,
-               label='Left lane')
-    for y_boundary in [-LANE_WIDTH/2, LANE_WIDTH/2, 3*LANE_WIDTH/2]:
-        ax.axhline(y_boundary, color='goldenrod', lw=1.5, ls='--')
-
-    ax.plot(lon_pos, lat_pos,     'k-',  lw=2,   label='True path')
-    ax.plot(lon_est[:, 0], lat_est[:, 0], 'b--', lw=1.5, label='IMM-KF estimate')
-    ax.plot(x_pred_lon[:, 0], x_pred_lat[:, 0], 'r--', lw=1.5, label='Prediction')
-
-    # Mark maneuver start
-    ax.plot(lon_pos[MANEUVER_STEP], lat_pos[MANEUVER_STEP],
-            'o', color='orange', ms=8, zorder=5, label='Maneuver onset')
-
-    ax.set_xlabel('Longitudinal Position [m]')
-    ax.set_ylabel('Lateral Position [m]')
-    ax.set_ylim([-LANE_WIDTH, 2 * LANE_WIDTH])
-    ax.legend(fontsize=7, ncol=3, loc='upper left')
-    ax.grid(True, alpha=0.3)
-    ax.set_aspect('auto')
+    axes[4].set_xlabel('Time [s]')
 
     plt.tight_layout()
     plt.savefig('imm_kf_lc.png', dpi=150, bbox_inches='tight')
