@@ -86,13 +86,21 @@ def make_lane_keeping_model(
     return KalmanModel(name=f"LaneKeeping(ref={p_ref:.1f})", F=F, H=H, Q=Q, R=R, E=E)
 
 
-def make_lateral_models(Ts: float) -> List[KalmanModel]:
+def make_lateral_models(
+    Ts: float,
+    K1: float = 1.5,
+    K2: float = 0.5,
+    sigma_w: float = 0.15,
+    sigma_obs: float = 0.15,
+    sigma_obs_vel: float = 0.0,
+) -> List[KalmanModel]:
     """
     Build the three lateral IMM-KF models from Carvalho et al. Section 3.1.2.
 
     State:  [e_y, ė_y]  — lateral error and its rate relative to the CURRENT
                           lane centre (y_ref), NOT absolute lateral position.
-    Obs:    [e_y]        — lateral error only
+    Obs:    [e_y]        — lateral error only (sigma_obs_vel == 0)
+         or [e_y, ė_y]  — lateral error + rate (sigma_obs_vel > 0)
 
     Three models, all sharing the same second-order feedback dynamics but with
     different reference offsets (affine term E):
@@ -101,19 +109,28 @@ def make_lateral_models(Ts: float) -> List[KalmanModel]:
       m1 — LaneChangeLeft  : p_ref = +LANE_WIDTH  → pulls e_y toward +LANE_WIDTH
       m2 — LaneChangeRight : p_ref = -LANE_WIDTH  → pulls e_y toward -LANE_WIDTH
 
-    Why lane-relative coordinates are required for 3 modes
-    -------------------------------------------------------
-    After a left lane change the vehicle settles at e_y = +LANE_WIDTH,  ė_y ≈ 0.
-    In ABSOLUTE coordinates that is exactly the LCL attractor, so the filter
-    would never leave LCL.  In LANE-RELATIVE coordinates the reference y_ref is
-    updated by +LANE_WIDTH once the maneuver is complete, making e_y ≈ 0 again
-    in the new frame → LaneKeep naturally becomes the best-fitting model.
+    Parameters
+    ----------
+    K1 : damping gain — higher = faster settling, less overshoot.
+    K2 : stiffness gain — higher = stronger pull toward p_ref = stronger
+         model discrimination.  Must satisfy K2 < K1²/4 for overdamped
+         (non-oscillatory) closed-loop eigenvalues.
+    sigma_w       : process noise std-dev [m/s²].
+    sigma_obs     : lateral position observation noise std-dev [m].
+    sigma_obs_vel : lateral velocity observation noise std-dev [m/s].
+                    When > 0, ė_y is added to the observation vector.
+                    E = [0, Ts·K2·p_ref] then has H@E = [0, Ts·K2·p_ref],
+                    giving direct per-step model discrimination (no delay).
     """
     LANE_WIDTH = 3.6   # metres — standard highway lane
-    K1  = 1.2          # damping gain  (affects settling time)
-    K2  = 2.5          # stiffness gain (affects convergence speed)
-    sw  = 0.05         # process noise std-dev
-    so  = 0.15         # lateral obs noise std-dev
+
+    if sigma_obs_vel > 0:
+        H = np.array([[1.0, 0.0],
+                      [0.0, 1.0]])
+        R = np.diag([sigma_obs**2, sigma_obs_vel**2])
+    else:
+        H = np.array([[1.0, 0.0]])
+        R = np.array([[sigma_obs**2]])
 
     models = []
     for name, p_ref in [("LaneKeep",        0.0),
@@ -121,11 +138,9 @@ def make_lateral_models(Ts: float) -> List[KalmanModel]:
                          ("LaneChangeRight", -LANE_WIDTH)]:
         F = np.array([[1.0,        Ts       ],
                       [-Ts * K2,  1 - Ts*K1]])
-        H = np.array([[1.0, 0.0]])
         E = np.array([0.0, Ts * K2 * p_ref])
-        Q = sw**2 * np.array([[Ts**4 / 4, Ts**3 / 2],
-                               [Ts**3 / 2, Ts**2    ]])
-        R = np.array([[so**2]])
+        Q = sigma_w**2 * np.array([[Ts**4 / 4, Ts**3 / 2],
+                                    [Ts**3 / 2, Ts**2    ]])
         models.append(KalmanModel(name=name, F=F, H=H, Q=Q, R=R, E=E))
     return models
 

@@ -11,7 +11,17 @@ import numpy as np
 from typing import Tuple
 import matplotlib.pyplot as plt
 from imm_kf import KalmanModel, IMMState, IMMKF
-from models import make_lateral_models
+from models import make_lateral_models, make_constant_velocity_model, make_constant_acceleration_model
+from params_lc import (
+    RANDOM_SEED, Ts, N_STEPS, LANE_WIDTH, MANEUVER_STEP, LC_DURATION,
+    LON_VEL_INIT, LON_ACCEL,
+    LON_OBS_NOISE, LAT_OBS_NOISE,
+    SIGMA_A_CV, SIGMA_J_CA, PI_LON, MU0_LON, P0_LON,
+    K1_LAT, K2_LAT, SIGMA_W_LAT, SIGMA_OBS_LAT_VEL,
+    P_STAY_LAT, MU0_LAT, P0_LAT,
+    PROB_THRESH, DIST_THRESH_FRAC, VEL_THRESH, MU_RESET_LAT,
+    PRED_STEPS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -81,91 +91,84 @@ def run_demo():
       Row 5 — lateral model probabilities
       Row 6 — bird's-eye vehicle trajectory
     """
-    np.random.seed(42)
+    np.random.seed(RANDOM_SEED)
 
-    Ts            = 0.1
-    N_steps       = 80
-    t             = np.arange(N_steps) * Ts
-    LANE_WIDTH    = 3.6
-    maneuver_step = 30          # index at which both maneuvers begin
-    lc_duration   = 20          # lateral lane change completes over 20 steps
+    t             = np.arange(N_STEPS) * Ts
+    DIST_THRESH   = LANE_WIDTH * DIST_THRESH_FRAC
 
     # -----------------------------------------------------------------------
     # Ground truth
     # -----------------------------------------------------------------------
 
     # Longitudinal
-    lon_pos = np.zeros(N_steps)
-    lon_vel = np.zeros(N_steps)
-    lon_vel[0] = 10.0
-    for k in range(1, N_steps):
-        a = 0.0 if k < maneuver_step else 2.0
+    lon_pos = np.zeros(N_STEPS)
+    lon_vel = np.zeros(N_STEPS)
+    lon_vel[0] = LON_VEL_INIT
+    for k in range(1, N_STEPS):
+        a = 0.0 if k < MANEUVER_STEP else LON_ACCEL
         lon_vel[k] = lon_vel[k-1] + Ts * a
         lon_pos[k] = lon_pos[k-1] + Ts * lon_vel[k-1] + 0.5 * Ts**2 * a
 
     # Lateral (sigmoid lane change to the left)
     lat_pos, lat_vel = simulate_lane_change(
-        N_steps, Ts,
-        change_start=maneuver_step,
-        change_duration=lc_duration,
+        N_STEPS, Ts,
+        change_start=MANEUVER_STEP,
+        change_duration=LC_DURATION,
         lane_width=LANE_WIDTH,
     )
 
     # -----------------------------------------------------------------------
     # Noisy measurements
     # -----------------------------------------------------------------------
-    lon_obs_noise = 0.3
-    lat_obs_noise = 0.15
-
     y_lon = np.column_stack([
-        lon_pos + np.random.randn(N_steps) * lon_obs_noise,
-        lon_vel + np.random.randn(N_steps) * lon_obs_noise,
+        lon_pos + np.random.randn(N_STEPS) * LON_OBS_NOISE,
+        lon_vel + np.random.randn(N_STEPS) * LON_OBS_NOISE,
     ])
-    y_lat = lat_pos + np.random.randn(N_steps) * lat_obs_noise   # shape (N,)
+    y_lat     = lat_pos + np.random.randn(N_STEPS) * LAT_OBS_NOISE      # position obs
+    y_lat_vel = lat_vel + np.random.randn(N_STEPS) * SIGMA_OBS_LAT_VEL  # velocity obs
 
     # -----------------------------------------------------------------------
-    # Build longitudinal IMM-KF  (CV and CA embedded in 3-state space)
+    # Build longitudinal IMM-KF  (CV and CA, both in 3-state space)
     # -----------------------------------------------------------------------
-    F_cv = np.array([[1, Ts, 0   ],
-                     [0,  1, 0   ],
-                     [0,  0, 0   ]])
-    H_lon = np.array([[1, 0, 0],
-                      [0, 1, 0]])
-    Q_cv  = np.diag([0.25*Ts**4, Ts**2, 4.0])
-    R_lon = lon_obs_noise**2 * np.eye(2)
+    # CA: factory produces a 3-state [pos, vel, accel] model observing [pos, vel]
+    ca_model = make_constant_acceleration_model(Ts, sigma_j=SIGMA_J_CA, sigma_obs=LON_OBS_NOISE)
+
+    # CV: factory produces a 2-state [pos, vel] model observing [pos].
+    # Embed into 3-state space by padding F and Q with zeros for the unused
+    # acceleration dimension, and expand H/R to observe [pos, vel] to match CA.
+    _cv2 = make_constant_velocity_model(Ts, sigma_a=SIGMA_A_CV, sigma_obs=LON_OBS_NOISE)
+    F_cv = np.zeros((3, 3));  F_cv[:2, :2] = _cv2.F   # accel row zeroed → vel held constant
+    Q_cv = np.zeros((3, 3));  Q_cv[:2, :2] = _cv2.Q
+    H_lon = np.array([[1, 0, 0], [0, 1, 0]])
+    R_lon = LON_OBS_NOISE**2 * np.eye(2)
     cv_model = KalmanModel("CV", F_cv, H_lon, Q_cv, R_lon)
 
-    F_ca = np.array([[1, Ts, 0.5*Ts**2],
-                     [0,  1,        Ts],
-                     [0,  0,         1]])
-    Q_ca = np.diag([Ts**4/36, Ts**2/4, 1.0])
-    ca_model = KalmanModel("CA", F_ca, H_lon, Q_ca, R_lon)
-
-    pi_lon = np.array([[0.95, 0.05],
-                       [0.05, 0.95]])
-    imm_lon = IMMKF([cv_model, ca_model], pi_lon, mu0=np.array([0.5, 0.5]))
+    imm_lon = IMMKF([cv_model, ca_model], PI_LON, mu0=MU0_LON)
     state_lon = imm_lon.init(
         x0=np.array([lon_pos[0], lon_vel[0], 0.0]),
-        P0=np.diag([1.0, 1.0, 1.0]),
+        P0=P0_LON,
     )
 
     # -----------------------------------------------------------------------
     # Build lateral IMM-KF  (LaneKeep, LaneChangeLeft, LaneChangeRight)
     # -----------------------------------------------------------------------
-    lat_models = make_lateral_models(Ts)
+    lat_models = make_lateral_models(
+        Ts, K1=K1_LAT, K2=K2_LAT,
+        sigma_w=SIGMA_W_LAT, sigma_obs=LAT_OBS_NOISE,
+        sigma_obs_vel=SIGMA_OBS_LAT_VEL,
+    )
 
     # Transition matrix: lane changes are rare; once started, likely to persist
-    p_stay   = 0.9
-    p_switch = (1 - p_stay) / 2
+    p_switch = (1 - P_STAY_LAT) / 2
     pi_lat = np.array([
-        [p_stay,   p_switch, p_switch],
-        [p_switch, p_stay,   p_switch],
-        [p_switch, p_switch, p_stay  ],
+        [P_STAY_LAT, p_switch,   p_switch  ],
+        [p_switch,   P_STAY_LAT, p_switch  ],
+        [p_switch,   p_switch,   P_STAY_LAT],
     ])
-    imm_lat = IMMKF(lat_models, pi_lat, mu0=np.array([0.8, 0.1, 0.1]))
+    imm_lat = IMMKF(lat_models, pi_lat, mu0=MU0_LAT)
     state_lat = imm_lat.init(
         x0=np.array([lat_pos[0], lat_vel[0]]),
-        P0=np.diag([0.1, 0.1]),
+        P0=P0_LAT,
     )
 
     # -----------------------------------------------------------------------
@@ -182,17 +185,13 @@ def run_demo():
     y_ref = 0.0
     lc_done = False  # guard against re-triggering on the same maneuver
 
-    # Completion thresholds
-    PROB_THRESH = 0.55          # dominant model probability
-    DIST_THRESH = LANE_WIDTH * 0.75  # vehicle is ≥75 % across the lane gap
-    VEL_THRESH  = 0.25          # lateral velocity nearly zero [m/s]
-
-    for k in range(N_steps):
+    for k in range(N_STEPS):
         state_lon = imm_lon.step(state_lon, y_lon[k])
 
         # Feed lane-relative measurement to the lateral filter
         e_y_meas = y_lat[k] - y_ref
-        state_lat = imm_lat.step(state_lat, np.array([e_y_meas]))
+        z_lat = np.array([e_y_meas, y_lat_vel[k]]) if SIGMA_OBS_LAT_VEL > 0 else np.array([e_y_meas])
+        state_lat = imm_lat.step(state_lat, z_lat)
 
         mu         = state_lat.mu
         e_y_est    = state_lat.x_est[0]
@@ -219,7 +218,7 @@ def run_demo():
                 state_lat = IMMState(
                     x_est    = new_x_est,
                     P_est    = state_lat.P_est,
-                    mu       = np.array([0.7, 0.15, 0.15]),  # reset toward LK
+                    mu       = MU_RESET_LAT.copy(),
                     x_models = new_x_models,
                     P_models = state_lat.P_models,
                 )
@@ -238,9 +237,8 @@ def run_demo():
     mu_lat_hist = np.array(mu_lat_hist)
 
     # -----------------------------------------------------------------------
-    # Predictions from final state (20 steps = 2 s ahead)
+    # Predictions from final state
     # -----------------------------------------------------------------------
-    PRED_STEPS = 20
     x_pred_lon, P_pred_lon, best_lon = imm_lon.predict(state_lon, T=PRED_STEPS)
     x_pred_lat, P_pred_lat, best_lat = imm_lat.predict(state_lat, T=PRED_STEPS)
     # Predictions are in lane-relative coords; shift back to absolute
@@ -259,7 +257,7 @@ def run_demo():
     # -----------------------------------------------------------------------
     # Plots
     # -----------------------------------------------------------------------
-    t_maneuver = maneuver_step * Ts
+    t_maneuver = MANEUVER_STEP * Ts
 
     fig, axes = plt.subplots(6, 1, figsize=(11, 18))
     fig.suptitle(
@@ -360,7 +358,7 @@ def run_demo():
     ax.plot(x_pred_lon[:, 0], x_pred_lat[:, 0], 'r--', lw=1.5, label='Prediction')
 
     # Mark maneuver start
-    ax.plot(lon_pos[maneuver_step], lat_pos[maneuver_step],
+    ax.plot(lon_pos[MANEUVER_STEP], lat_pos[MANEUVER_STEP],
             'o', color='orange', ms=8, zorder=5, label='Maneuver onset')
 
     ax.set_xlabel('Longitudinal Position [m]')
