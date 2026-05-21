@@ -93,6 +93,7 @@ def make_lateral_models(
     sigma_w: float = 0.15,
     sigma_obs: float = 0.15,
     sigma_obs_vel: float = 0.0,
+    extra_specs: list = None,   # [(name, p_ref, K1, K2), ...]
 ) -> List[KalmanModel]:
     """
     Build the three lateral IMM-KF models from Carvalho et al. Section 3.1.2.
@@ -132,16 +133,21 @@ def make_lateral_models(
         H = np.array([[1.0, 0.0]])
         R = np.array([[sigma_obs**2]])
 
-    models = []
-    for name, p_ref in [("LaneKeep",        0.0),
-                         ("LaneChangeLeft",  +LANE_WIDTH),
-                         ("LaneChangeRight", -LANE_WIDTH)]:
-        F = np.array([[1.0,        Ts       ],
-                      [-Ts * K2,  1 - Ts*K1]])
-        E = np.array([0.0, Ts * K2 * p_ref])
+    def _make(name, p_ref, k1, k2):
+        F = np.array([[1.0,       Ts       ],
+                      [-Ts * k2, 1 - Ts*k1]])
+        E = np.array([0.0, Ts * k2 * p_ref])
         Q = sigma_w**2 * np.array([[Ts**4 / 4, Ts**3 / 2],
                                     [Ts**3 / 2, Ts**2    ]])
-        models.append(KalmanModel(name=name, F=F, H=H, Q=Q, R=R, E=E))
+        return KalmanModel(name=name, F=F, H=H, Q=Q, R=R, E=E)
+
+    models = [
+        _make("LaneKeep",        0.0,        K1, K2),
+        _make("LaneChangeLeft",  +LANE_WIDTH, K1, K2),
+        _make("LaneChangeRight", -LANE_WIDTH, K1, K2),
+    ]
+    for name, p_ref, k1, k2 in (extra_specs or []):
+        models.append(_make(name, p_ref, k1, k2))
     return models
 
 

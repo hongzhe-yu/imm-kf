@@ -17,9 +17,9 @@ from params_lc import (
     LON_VEL_INIT, LON_ACCEL,
     LON_OBS_NOISE, LAT_OBS_NOISE,
     SIGMA_A_CV, SIGMA_J_CA, PI_LON, MU0_LON, P0_LON,
-    K1_LAT, K2_LAT, SIGMA_W_LAT, SIGMA_OBS_LAT_VEL,
-    P_STAY_LAT, MU0_LAT, P0_LAT,
-    PROB_THRESH, DIST_THRESH_FRAC, VEL_THRESH, MU_RESET_LAT,
+    K1_LAT, K2_LAT, K1_LAT2, K2_LAT2, SIGMA_W_LAT, SIGMA_OBS_LAT_VEL,
+    P_STAY_LAT, P_SWITCH_LAT_LC, MU0_LAT, P0_LAT,
+    DIST_THRESH_FRAC, VEL_THRESH, MU_RESET_LAT,
     PRED_STEPS,
 )
 
@@ -68,29 +68,17 @@ def simulate_lane_change(
 # Demonstration / usage example
 # ---------------------------------------------------------------------------
 
-def run_demo():
+def run_demo(direction: str = "left"):
     """
     Joint longitudinal + lateral IMM-KF demo.
 
-    Scenario
-    --------
-    A vehicle drives straight at 10 m/s for 3 s, then simultaneously:
-      - longitudinally: accelerates at 2 m/s² (CV → CA maneuver)
-      - laterally:      performs a left lane change over ~2 s  (LK → LCL)
-
-    Two decoupled IMM-KFs run in parallel — exactly as in both papers.
-
-    Longitudinal IMM-KF  (2 models):  CV, CA
-    Lateral IMM-KF       (3 models):  LaneKeep, LaneChangeLeft, LaneChangeRight
-
-    We plot:
-      Row 1 — longitudinal position
-      Row 2 — longitudinal velocity
-      Row 3 — lateral position (with lane boundaries)
-      Row 4 — longitudinal model probabilities
-      Row 5 — lateral model probabilities
-      Row 6 — bird's-eye vehicle trajectory
+    Parameters
+    ----------
+    direction : "left" or "right" — which lane the vehicle changes into.
     """
+    assert direction in ("left", "right"), "direction must be 'left' or 'right'"
+    sign = 1 if direction == "left" else -1
+
     np.random.seed(RANDOM_SEED)
 
     t             = np.arange(N_STEPS) * Ts
@@ -109,12 +97,12 @@ def run_demo():
         lon_vel[k] = lon_vel[k-1] + Ts * a
         lon_pos[k] = lon_pos[k-1] + Ts * lon_vel[k-1] + 0.5 * Ts**2 * a
 
-    # Lateral (sigmoid lane change to the left)
+    # Lateral (sigmoid lane change in the requested direction)
     lat_pos, lat_vel = simulate_lane_change(
         N_STEPS, Ts,
         change_start=MANEUVER_STEP,
         change_duration=LC_DURATION,
-        lane_width=LANE_WIDTH,
+        lane_width=sign * LANE_WIDTH,
     )
 
     # -----------------------------------------------------------------------
@@ -156,15 +144,36 @@ def run_demo():
         Ts, K1=K1_LAT, K2=K2_LAT,
         sigma_w=SIGMA_W_LAT, sigma_obs=LAT_OBS_NOISE,
         sigma_obs_vel=SIGMA_OBS_LAT_VEL,
+        extra_specs=[
+            ("LCL-Gentle",  LANE_WIDTH, K1_LAT2, K2_LAT2),
+            ("LCR-Gentle", -LANE_WIDTH, K1_LAT2, K2_LAT2),
+        ],
     )
 
-    # Transition matrix: lane changes are rare; once started, likely to persist
-    p_switch = (1 - P_STAY_LAT) / 2
-    pi_lat = np.array([
-        [P_STAY_LAT, p_switch,   p_switch  ],
-        [p_switch,   P_STAY_LAT, p_switch  ],
-        [p_switch,   p_switch,   P_STAY_LAT],
-    ])
+    # Transition matrix: within-direction transitions use a larger probability.
+    # Models sharing the same direction keyword ("Left" / "Right") form a group.
+    n_lat  = len(lat_models)
+    groups = [[i for i, m in enumerate(lat_models) if kw in m.name]
+              for kw in ("Left", "Right")]
+    groups = [g for g in groups if len(g) > 1]   # keep only multi-member groups
+
+    pi_lat = np.zeros((n_lat, n_lat))
+    for i in range(n_lat):
+        pi_lat[i, i] = P_STAY_LAT
+        my_group = next((g for g in groups if i in g), None)
+        if my_group:
+            peers    = [j for j in my_group if j != i]
+            others   = [j for j in range(n_lat) if j != i and j not in my_group]
+            p_others = (1 - P_STAY_LAT - P_SWITCH_LAT_LC * len(peers)) / len(others)
+            for j in peers:
+                pi_lat[i, j] = P_SWITCH_LAT_LC
+            for j in others:
+                pi_lat[i, j] = p_others
+        else:
+            p_generic = (1 - P_STAY_LAT) / (n_lat - 1)
+            for j in range(n_lat):
+                if j != i:
+                    pi_lat[i, j] = p_generic
     imm_lat = IMMKF(lat_models, pi_lat, mu0=MU0_LAT)
     state_lat = imm_lat.init(
         x0=np.array([lat_pos[0], lat_vel[0]]),
@@ -193,7 +202,6 @@ def run_demo():
         z_lat = np.array([e_y_meas, y_lat_vel[k]]) if SIGMA_OBS_LAT_VEL > 0 else np.array([e_y_meas])
         state_lat = imm_lat.step(state_lat, z_lat)
 
-        mu         = state_lat.mu
         e_y_est    = state_lat.x_est[0]
         e_ydot_est = state_lat.x_est[1]
 
@@ -202,12 +210,8 @@ def run_demo():
         # centre, and lateral velocity has settled, shift the reference and
         # re-centre the filter so LaneKeep becomes the correct model again.
         if not lc_done:
-            completed_left  = (mu[1] > PROB_THRESH
-                               and e_y_est  >  DIST_THRESH
-                               and abs(e_ydot_est) < VEL_THRESH)
-            completed_right = (mu[2] > PROB_THRESH
-                               and e_y_est  < -DIST_THRESH
-                               and abs(e_ydot_est) < VEL_THRESH)
+            completed_left  = (e_y_est >  DIST_THRESH and abs(e_ydot_est) < VEL_THRESH)
+            completed_right = (e_y_est < -DIST_THRESH and abs(e_ydot_est) < VEL_THRESH)
             if completed_left or completed_right:
                 delta = LANE_WIDTH if completed_left else -LANE_WIDTH
                 y_ref += delta
@@ -249,8 +253,10 @@ def run_demo():
 
     print(f"\n--- Final model probabilities ---")
     print(f"Longitudinal:  CV={mu_lon_hist[-1,0]:.3f}  CA={mu_lon_hist[-1,1]:.3f}")
-    print(f"Lateral:       LK={mu_lat_hist[-1,0]:.3f}  "
-          f"LCL={mu_lat_hist[-1,1]:.3f}  LCR={mu_lat_hist[-1,2]:.3f}")
+    lat_prob_str = "  ".join(
+        f"{m.name}={mu_lat_hist[-1, i]:.3f}" for i, m in enumerate(lat_models)
+    )
+    print(f"Lateral:       {lat_prob_str}")
     print(f"Most probable longitudinal model: {imm_lon.models[best_lon].name}")
     print(f"Most probable lateral model:      {imm_lat.models[best_lat].name}")
 
@@ -261,8 +267,8 @@ def run_demo():
 
     fig, axes = plt.subplots(5, 1, figsize=(11, 15))
     fig.suptitle(
-        "IMM-KF: Joint Longitudinal + Lateral Estimation\n"
-        "Vehicle accelerates AND changes lane left at t = 3 s",
+        f"IMM-KF: Joint Longitudinal + Lateral Estimation\n"
+        f"Vehicle accelerates AND changes lane {direction} at t = {MANEUVER_STEP*Ts:.0f} s",
         fontsize=13, fontweight='bold',
     )
 
@@ -302,12 +308,13 @@ def run_demo():
 
     # -- (2) Lateral position with lane markings --
     ax = axes[2]
-    # Lane boundaries (original lane: 0 ± LANE_WIDTH/2; left lane: LANE_WIDTH ± LW/2)
-    for y_boundary in [-LANE_WIDTH/2, LANE_WIDTH/2, 3*LANE_WIDTH/2]:
+    target_lane = sign * LANE_WIDTH
+    inner = min(0, target_lane); outer = max(0, target_lane)
+    for y_boundary in [inner - LANE_WIDTH/2, inner + LANE_WIDTH/2, outer + sign * LANE_WIDTH/2]:
         ax.axhline(y_boundary, color='goldenrod', lw=1.2, ls='--', alpha=0.7)
-    ax.axhline(0,          color='goldenrod', lw=0.7, ls=':',  alpha=0.5,
+    ax.axhline(0,           color='goldenrod', lw=0.7, ls=':', alpha=0.5,
                label='Lane centres / boundaries')
-    ax.axhline(LANE_WIDTH, color='goldenrod', lw=0.7, ls=':',  alpha=0.5)
+    ax.axhline(target_lane, color='goldenrod', lw=0.7, ls=':', alpha=0.5)
 
     ax.plot(t, lat_pos, 'k-', lw=2, label='True lateral pos')
     ax.plot(t, y_lat,   '.', color='gray', ms=3, alpha=0.5, label='Measurement')
@@ -333,7 +340,7 @@ def run_demo():
     ax.grid(True, alpha=0.3)
 
     # -- (4) Lateral model probabilities --
-    colors_lat = ['steelblue', 'forestgreen', 'crimson']
+    colors_lat = ['steelblue', 'forestgreen', 'crimson', 'darkorange', 'mediumpurple']
     ax = axes[4]
     for i, (m, c) in enumerate(zip(lat_models, colors_lat)):
         ax.plot(t, mu_lat_hist[:, i], lw=2, color=c, label=f'P({m.name})')
@@ -346,10 +353,12 @@ def run_demo():
     axes[4].set_xlabel('Time [s]')
 
     plt.tight_layout()
-    plt.savefig('imm_kf_lc.png', dpi=150, bbox_inches='tight')
+    fname = f"imm_kf_lc_{direction}.png"
+    plt.savefig(fname, dpi=150, bbox_inches='tight')
     plt.close()
-    print("\nPlot saved to imm_kf_lc.png")
+    print(f"\nPlot saved to {fname}")
 
 
 if __name__ == "__main__":
-    run_demo()
+    run_demo("left")
+    run_demo("right")
